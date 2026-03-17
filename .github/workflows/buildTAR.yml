@@ -16,6 +16,7 @@ jobs:
         pkg: [rpm, deb]
 
     env:
+      SEALOS_VERSION: v5.1.1
       K8S_VERSION: v1.30.14
       CALICO_VERSION: v3.27.4
       INGRESS_VERSION: v1.11.3
@@ -30,9 +31,13 @@ jobs:
       # ======================
       - name: Install sealos
         run: |
-          wget https://github.com/labring/sealos/releases/download/v5.0.0/sealos-linux-amd64.tar.gz
-          tar -xvf sealos-linux-amd64.tar.gz
-          chmod +x sealos
+          set -euo pipefail
+          SEALOS_PKG="sealos_${SEALOS_VERSION#v}_linux_amd64.tar.gz"
+          curl -fL --retry 3 --retry-delay 2 -o "$SEALOS_PKG" \
+            "https://github.com/labring/sealos/releases/download/${SEALOS_VERSION}/${SEALOS_PKG}"
+          tar -xvf "$SEALOS_PKG"
+          install -m 0755 sealos /usr/local/bin/sealos
+          sealos version
 
       # ======================
       # 构建 K8s 镜像列表
@@ -58,16 +63,21 @@ jobs:
       # ======================
       - name: Build k8s image tar
         run: |
-          ./sealos pull $(cat k8s-images.txt)
-          ./sealos save -o k8s-images.tar $(cat k8s-images.txt)
+          set -euo pipefail
+          mapfile -t K8S_IMAGES < k8s-images.txt
+          sealos pull "${K8S_IMAGES[@]}"
+          sealos save -o k8s-images.tar "${K8S_IMAGES[@]}"
 
       # ======================
       # 拉取 & 打包 Rancher 镜像
       # ======================
       - name: Build rancher image tar
         run: |
-          ./sealos pull $(cat rancher-images.txt)
-          ./sealos save -o rancher-images.tar $(cat rancher-images.txt)
+          set -euo pipefail
+          grep -vE '^[[:space:]]*(#|$)' rancher-images.txt > rancher-images.clean.txt
+          mapfile -t RANCHER_IMAGES < rancher-images.clean.txt
+          sealos pull "${RANCHER_IMAGES[@]}"
+          sealos save -o rancher-images.tar "${RANCHER_IMAGES[@]}"
 
       # ======================
       # RPM 构建
@@ -111,10 +121,14 @@ jobs:
       # ======================
       - name: Prepare Rancher charts
         run: |
+          set -euo pipefail
           mkdir -p rancher/charts rancher/helm
           curl -LO https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz
           tar -zxvf helm-v3.14.0-linux-amd64.tar.gz
-          mv linux-amd64/helm rancher/helm/
+          install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          cp /usr/local/bin/helm rancher/helm/helm
+
+          helm version
 
           ./sealos run docker.io/alpine/helm:3.14.0 version || true
 
