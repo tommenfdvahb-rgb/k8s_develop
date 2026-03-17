@@ -154,6 +154,19 @@ MASTERS="${MASTERS:-}"
 NODES="${NODES:-}"
 PASSWORD="${PASSWORD:-}"
 PORT="${PORT:-22}"
+ACTION="${ACTION:-}"
+SKIP_RANCHER="${SKIP_RANCHER:-0}"
+RANCHER_HOSTNAME="${RANCHER_HOSTNAME:-rancher.local}"
+RANCHER_NAMESPACE="${RANCHER_NAMESPACE:-cattle-system}"
+RANCHER_CHART_DIR="${RANCHER_CHART_DIR:-}"
+
+if [[ -z "$ACTION" ]]; then
+	if [[ -n "$OFFLINE_TAR" ]]; then
+		ACTION="full"
+	else
+		ACTION="menu"
+	fi
+fi
 
 usage() {
 	cat <<EOF
@@ -163,29 +176,48 @@ MASTERS=1.1.1.1,1.1.1.2 \
 NODES=1.1.1.3 \
 PASSWORD=xxx \
 bash install.sh
+
+可选动作:
+ACTION=menu        # 菜单模式(默认)
+ACTION=full        # 全部部署(环境校验+依赖安装+K8s部署+Rancher)
+ACTION=simple      # 简单部署(环境校验+K8s部署)
+ACTION=rancher     # 仅安装 Rancher
+ACTION=precheck    # 仅环境校验
+ACTION=postcheck   # 仅集群后置检查
+ACTION=config      # 打印当前配置
 EOF
 	exit 1
 }
 
-[[ -z "$OFFLINE_TAR" ]] && usage
+show_config() {
+	cat <<EOF
+当前配置:
+- ACTION=$ACTION
+- OFFLINE_TAR=$OFFLINE_TAR
+- MASTERS=$MASTERS
+- NODES=$NODES
+- PORT=$PORT
+- SKIP_RANCHER=$SKIP_RANCHER
+- RANCHER_HOSTNAME=$RANCHER_HOSTNAME
+- RANCHER_NAMESPACE=$RANCHER_NAMESPACE
+- RANCHER_CHART_DIR=$RANCHER_CHART_DIR
+- LOG_FILE=$LOG_FILE
+- DRY_RUN=$DRY_RUN
+EOF
+}
 
-# ================== 主流程 ==================
-main() {
-	require_root
-	require_cmds tar awk timeout
+require_deploy_params() {
+	[[ -z "$OFFLINE_TAR" ]] && die "OFFLINE_TAR 不能为空"
+	[[ -z "$MASTERS" ]] && die "MASTERS 不能为空"
+}
 
-	precheck
-	install_deps
+deploy_k8s() {
+	require_deploy_params
 	validate_tar "$OFFLINE_TAR"
 	ensure_sealos
 
-	if [[ -n "$MASTERS" ]]; then
-		check_ssh "$MASTERS" "$PORT"
-	fi
-
-	if [[ -n "$NODES" ]]; then
-		check_ssh "$NODES" "$PORT"
-	fi
+	check_ssh "$MASTERS" "$PORT"
+	[[ -n "$NODES" ]] && check_ssh "$NODES" "$PORT"
 
 	log "开始部署 K8s 集群..."
 
@@ -195,8 +227,133 @@ main() {
 	args+=(--port "$PORT")
 
 	run_cmd "${args[@]}"
+}
 
+ensure_helm() {
+	if command -v helm >/dev/null; then
+		return
+	fi
+
+	if [[ -x ./helm ]]; then
+		install -m 0755 ./helm /usr/bin/helm
+	elif [[ -x ../rancher/helm/helm ]]; then
+		install -m 0755 ../rancher/helm/helm /usr/bin/helm
+	else
+		die "未找到 helm，请放在脚本目录或 ../rancher/helm/helm"
+	fi
+}
+
+find_chart_file() {
+	local chart_dir="$1"
+	local pattern="$2"
+	local f
+	for f in "$chart_dir"/$pattern; do
+		if [[ -f "$f" ]]; then
+			echo "$f"
+			return 0
+		fi
+	done
+	return 1
+}
+
+install_rancher() {
+	log "开始安装 Rancher..."
+	require_cmds kubectl
+	ensure_helm
+
+	if [[ "$DRY_RUN" == "1" ]]; then
+		log "+ kubectl create namespace $RANCHER_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -"
+	else
+		kubectl create namespace "$RANCHER_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+	fi
+
+	if [[ -n "$RANCHER_CHART_DIR" ]]; then
+		cert_chart="$(find_chart_file "$RANCHER_CHART_DIR" "cert-manager-*.tgz")" || die "离线 chart 不存在: cert-manager-*.tgz"
+		rancher_chart="$(find_chart_file "$RANCHER_CHART_DIR" "rancher-*.tgz")" || die "离线 chart 不存在: rancher-*.tgz"
+
+		run_cmd helm upgrade --install cert-manager "$cert_chart" --namespace cert-manager --create-namespace
+		run_cmd helm upgrade --install rancher "$rancher_chart" --namespace "$RANCHER_NAMESPACE" --set hostname="$RANCHER_HOSTNAME"
+	else
+		run_cmd helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+		run_cmd helm repo add jetstack https://charts.jetstack.io
+		run_cmd helm repo update
+
+		run_cmd helm upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.13.3
+		run_cmd helm upgrade --install rancher rancher-stable/rancher --namespace "$RANCHER_NAMESPACE" --set hostname="$RANCHER_HOSTNAME"
+	fi
+
+	log "Rancher 安装命令已执行，建议检查: kubectl get pods -n $RANCHER_NAMESPACE"
+}
+
+full_deploy() {
+	precheck
+	install_deps
+	deploy_k8s
 	post_check
+
+	if [[ "$SKIP_RANCHER" != "1" ]]; then
+		install_rancher
+	else
+		log "SKIP_RANCHER=1，跳过 Rancher 安装"
+	fi
+}
+
+simple_deploy() {
+	precheck
+	deploy_k8s
+	post_check
+}
+
+print_menu() {
+	cat <<EOF
+
+================= 部署菜单 =================
+1) 全部部署 (环境校验 + 依赖安装 + K8s + Rancher)
+2) 简单部署 (环境校验 + K8s)
+3) 安装 Rancher
+4) 环境校验
+5) 集群后置检查
+6) 显示当前配置
+0) 退出
+===========================================
+EOF
+}
+
+menu_mode() {
+	while true; do
+		print_menu
+		read -rp "请输入菜单编号: " choice
+		case "$choice" in
+			1) full_deploy ;;
+			2) simple_deploy ;;
+			3) install_rancher ;;
+			4) precheck ;;
+			5) post_check ;;
+			6) show_config ;;
+			0) log "退出"; break ;;
+			*) warn "无效选项: $choice" ;;
+		esac
+	done
+}
+
+run_action() {
+	case "$ACTION" in
+		menu) menu_mode ;;
+		full|all) full_deploy ;;
+		simple|k8s) simple_deploy ;;
+		rancher) install_rancher ;;
+		precheck|check) precheck ;;
+		postcheck) post_check ;;
+		config) show_config ;;
+		*) usage ;;
+	esac
+}
+
+# ================== 主流程 ==================
+main() {
+	require_root
+	require_cmds tar awk timeout
+	run_action
 }
 
 # ================== 部署后检查 ==================
