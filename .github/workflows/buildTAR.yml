@@ -149,8 +149,19 @@ jobs:
         run: |
           mkdir -p release/images release/packages release/bin release/scripts
 
+          # 运行容器时会生成 root 所有的文件，确保我们有权限移动
+          sudo chown -R "$(id -u):$(id -g)" packages || true
+
           mv k8s-images.tar release/images/
-          mv packages/* release/packages/ || true
+
+          case "${{ matrix.pkg }}" in
+            rpm)
+              mv packages/rpm release/packages/ || true
+              ;;
+            deb)
+              mv packages/deb release/packages/ || true
+              ;;
+          esac
 
           cp install.sh release/scripts/
 
@@ -160,6 +171,7 @@ jobs:
       # 发布 Release
       # ======================
       - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz
