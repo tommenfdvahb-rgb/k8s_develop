@@ -1,4 +1,4 @@
-name: Build K8s Offline Package
+name: Build Rancher Offline Package
 
 on:
   workflow_dispatch:
@@ -14,14 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
-        pkg: [rpm, deb]
 
     env:
       SEALOS_VERSION: v5.1.1
-      K8S_VERSION: v1.30.14
-      CALICO_VERSION: v3.27.4
-      INGRESS_VERSION: v1.11.3
-      LONGHORN_VERSION: v1.6.4
+      RANCHER_VERSION: v2.8.5
+      HELM_VERSION: v3.14.0
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +29,6 @@ jobs:
       - name: Install sealos
         run: |
           set -euo pipefail
-          # GitHub Actions runners are typically amd64; use runner arch so we can execute sealos locally.
           SEALOS_ARCH="$(uname -m)"
           case "$SEALOS_ARCH" in
             x86_64) SEALOS_ARCH=amd64 ;;
@@ -48,25 +44,27 @@ jobs:
           sealos version
 
       # ======================
-      # 构建 K8s 镜像列表
+      # 准备 Rancher 镜像列表
       # ======================
-      - name: Prepare k8s images
+      - name: Prepare rancher images
         run: |
-          cat <<EOF > k8s-images.txt
-          registry.cn-shanghai.aliyuncs.com/labring/kubernetes:${K8S_VERSION}
-          registry.cn-shanghai.aliyuncs.com/labring/calico:${CALICO_VERSION}
-          registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:${INGRESS_VERSION}
-          registry.cn-shanghai.aliyuncs.com/labring/longhorn:${LONGHORN_VERSION}
-          EOF
+          curl -LO https://github.com/rancher/rancher/releases/download/${RANCHER_VERSION}/rancher-images.txt
 
       # ======================
-      # 拉取 & 打包 K8s 镜像
+      # 拉取 & 打包 Rancher 镜像
       # ======================
-      - name: Build k8s image tar
+      - name: Build rancher image tar
         run: |
           set -euo pipefail
           mkdir -p tmp
           chmod 1777 tmp
+          grep -vE '^[[:space:]]*(#|$)' rancher-images.txt | while read -r img; do
+            case "$img" in
+              *.*/*|*:*/*|localhost/*) echo "$img" ;;
+              *) echo "docker.io/$img" ;;
+            esac
+          done > rancher-images.clean.txt
+
           docker run --rm --privileged \
             -e TARGET_ARCH="${{ matrix.arch }}" \
             -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
@@ -88,8 +86,8 @@ jobs:
               done
             }
             declare -a SUCCESSFUL_IMAGES=()
-            mapfile -t K8S_IMAGES < k8s-images.txt
-            for img in "${K8S_IMAGES[@]}"; do
+            mapfile -t RANCHER_IMAGES < rancher-images.clean.txt
+            for img in "${RANCHER_IMAGES[@]}"; do
               if /work/sealos pull --platform "linux/${TARGET_ARCH}" "$img" 2>/dev/null; then
                 SUCCESSFUL_IMAGES+=("$img")
                 echo "Pulled $img"
@@ -98,63 +96,48 @@ jobs:
               fi
             done
             if (( ${#SUCCESSFUL_IMAGES[@]} > 0 )); then
-              retry 3 /work/sealos save -o k8s-images.tar "${SUCCESSFUL_IMAGES[@]}"
+              retry 3 /work/sealos save -o rancher-images.tar "${SUCCESSFUL_IMAGES[@]}"
             else
               echo "No images to save for ${TARGET_ARCH}"
-              touch k8s-images.tar
+              touch rancher-images.tar
             fi
           '
 
       # ======================
-      # RPM 构建
+      # 下载 Helm + Rancher Chart
       # ======================
-      - name: Build RPM packages
-        if: matrix.pkg == 'rpm'
+      - name: Prepare Rancher charts
         run: |
-          docker run --rm -v $PWD:/out centos:7 bash -c "
-            yum install -y yum-utils createrepo
-            mkdir -p /out/packages/rpm
-            yumdownloader --resolve --destdir=/out/packages/rpm \
-              conntrack-tools socat ipset iptables \
-              nfs-utils iscsi-initiator-utils iproute \
-              nmap-ncat tar coreutils util-linux procps-ng openssh-clients
-            createrepo /out/packages/rpm
-          "
+          set -euo pipefail
+          mkdir -p rancher/charts rancher/helm
+          curl -LO https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz
+          tar -zxvf helm-v${HELM_VERSION}-linux-amd64.tar.gz
+          install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          cp /usr/local/bin/helm rancher/helm/helm
 
-      # ======================
-      # DEB 构建
-      # ======================
-      - name: Build DEB packages
-        if: matrix.pkg == 'deb'
-        run: |
-          docker run --rm -v $PWD:/out ubuntu:22.04 bash -c "
-            apt-get update
-            apt-get install -y dpkg-dev
-            mkdir -p /out/packages/deb
-            apt-get --download-only \
-              -o Dir::Cache::archives=/out/packages/deb \
-              install -y \
-              conntrack socat ipset iptables \
-              nfs-common open-iscsi \
-              iproute2 netcat-openbsd \
-              tar coreutils util-linux procps openssh-client
-            cd /out/packages/deb
-            dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
-          "
+          helm version
+
+          ./sealos run docker.io/alpine/helm:${HELM_VERSION} version || true
+
+          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+          helm repo add jetstack https://charts.jetstack.io
+
+          helm pull rancher-stable/rancher --version ${RANCHER_VERSION} -d rancher/charts
+          helm pull jetstack/cert-manager --version v1.13.3 -d rancher/charts
 
       # ======================
       # 打包最终离线包
       # ======================
       - name: Package
         run: |
-          mkdir -p release/images release/packages release/bin release/scripts
+          mkdir -p release/images release/rancher release/scripts
 
-          mv k8s-images.tar release/images/
-          mv packages/* release/packages/ || true
+          mv rancher-images.tar release/images/
+          mv rancher/* release/rancher/ || true
 
           cp install.sh release/scripts/
 
-          tar -czvf k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz release
+          tar -czvf rancher-offline-${{ matrix.arch }}.tar.gz release
 
       # ======================
       # 发布 Release
@@ -162,6 +145,6 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz
+          files: rancher-offline-${{ matrix.arch }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
