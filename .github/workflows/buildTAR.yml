@@ -111,8 +111,8 @@ jobs:
       - name: Build RPM packages
         if: matrix.pkg == 'rpm'
         run: |
-          docker run --rm -v $PWD:/out centos:7 bash -c "
-            yum install -y yum-utils createrepo
+          docker run --rm -v $PWD:/out rockylinux:8 bash -c "
+            dnf install -y yum-utils createrepo
             mkdir -p /out/packages/rpm
             yumdownloader --resolve --destdir=/out/packages/rpm \
               conntrack-tools socat ipset iptables \
