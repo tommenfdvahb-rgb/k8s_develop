@@ -73,10 +73,12 @@ jobs:
       - name: Build k8s image tar
         run: |
           set -euo pipefail
+          mkdir -p tmp
           docker run --rm --privileged \
             -e TARGET_ARCH="${{ matrix.arch }}" \
-            -v "$PWD:/work" -w /work ubuntu:22.04 bash -lc '
+            -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
             set -euo pipefail
+            export TMPDIR=/tmp
             apt-get update
             apt-get install -y --no-install-recommends fuse-overlayfs ca-certificates
             export CONTAINERS_STORAGE_DRIVER=vfs
@@ -105,6 +107,7 @@ jobs:
       - name: Build rancher image tar
         run: |
           set -euo pipefail
+          mkdir -p tmp
           grep -vE '^[[:space:]]*(#|$)' rancher-images.txt | while read -r img; do
             case "$img" in
               *.*/*|*:*/*|localhost/*) echo "$img" ;;
@@ -113,8 +116,9 @@ jobs:
           done > rancher-images.clean.txt
           docker run --rm --privileged \
             -e TARGET_ARCH="${{ matrix.arch }}" \
-            -v "$PWD:/work" -w /work ubuntu:22.04 bash -lc '
+            -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
             set -euo pipefail
+            export TMPDIR=/tmp
             apt-get update
             apt-get install -y --no-install-recommends fuse-overlayfs ca-certificates
             export CONTAINERS_STORAGE_DRIVER=vfs
