@@ -74,6 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tmp
+          chmod 1777 tmp
           docker run --rm --privileged \
             -e TARGET_ARCH="${{ matrix.arch }}" \
             -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
@@ -108,6 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tmp
+          chmod 1777 tmp
           grep -vE '^[[:space:]]*(#|$)' rancher-images.txt | while read -r img; do
             case "$img" in
               *.*/*|*:*/*|localhost/*) echo "$img" ;;
