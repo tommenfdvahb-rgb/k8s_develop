@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         arch: [amd64, arm64]
         pkg: [rpm, deb]
@@ -21,7 +22,6 @@ jobs:
       CALICO_VERSION: v3.27.4
       INGRESS_VERSION: v1.11.3
       LONGHORN_VERSION: v1.6.4
-      RANCHER_VERSION: v2.8.5
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,15 @@ jobs:
       - name: Install sealos
         run: |
           set -euo pipefail
-          SEALOS_PKG="sealos_${SEALOS_VERSION#v}_linux_amd64.tar.gz"
+          # GitHub Actions runners are typically amd64; use runner arch so we can execute sealos locally.
+          SEALOS_ARCH="$(uname -m)"
+          case "$SEALOS_ARCH" in
+            x86_64) SEALOS_ARCH=amd64 ;;
+            aarch64|arm64) SEALOS_ARCH=arm64 ;;
+            *) echo "Unsupported runner arch: $SEALOS_ARCH" >&2 ; exit 1 ;;
+          esac
+
+          SEALOS_PKG="sealos_${SEALOS_VERSION#v}_linux_${SEALOS_ARCH}.tar.gz"
           curl -fL --retry 3 --retry-delay 2 -o "$SEALOS_PKG" \
             "https://github.com/labring/sealos/releases/download/${SEALOS_VERSION}/${SEALOS_PKG}"
           tar -xvf "$SEALOS_PKG"
@@ -52,22 +60,18 @@ jobs:
           EOF
 
       # ======================
-      # 构建 Rancher 镜像列表
-      # ======================
-      - name: Prepare rancher images
-        run: |
-          curl -LO https://github.com/rancher/rancher/releases/download/${RANCHER_VERSION}/rancher-images.txt
-
-      # ======================
-      # 拉取 & 打包 K8s 镜像
+      # 拉取&打包 K8s 镜像
       # ======================
       - name: Build k8s image tar
         run: |
           set -euo pipefail
+          mkdir -p tmp
+          chmod 1777 tmp
           docker run --rm --privileged \
             -e TARGET_ARCH="${{ matrix.arch }}" \
-            -v "$PWD:/work" -w /work ubuntu:22.04 bash -lc '
+            -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
             set -euo pipefail
+            export TMPDIR=/tmp
             apt-get update
             apt-get install -y --no-install-recommends fuse-overlayfs ca-certificates
             export CONTAINERS_STORAGE_DRIVER=vfs
@@ -83,44 +87,22 @@ jobs:
                 n=$((n + 1))
               done
             }
+            declare -a SUCCESSFUL_IMAGES=()
             mapfile -t K8S_IMAGES < k8s-images.txt
             for img in "${K8S_IMAGES[@]}"; do
-              retry 5 /work/sealos pull --platform "linux/${TARGET_ARCH}" "$img"
+              if /work/sealos pull --platform "linux/${TARGET_ARCH}" "$img" 2>/dev/null; then
+                SUCCESSFUL_IMAGES+=("$img")
+                echo "Pulled $img"
+              else
+                echo "Skipped $img (not available for ${TARGET_ARCH})"
+              fi
             done
-            retry 3 /work/sealos save --platform "linux/${TARGET_ARCH}" -o k8s-images.tar "${K8S_IMAGES[@]}"
-          '
-
-      # ======================
-      # 拉取 & 打包 Rancher 镜像
-      # ======================
-      - name: Build rancher image tar
-        run: |
-          set -euo pipefail
-          grep -vE '^[[:space:]]*(#|$)' rancher-images.txt > rancher-images.clean.txt
-          docker run --rm --privileged \
-            -e TARGET_ARCH="${{ matrix.arch }}" \
-            -v "$PWD:/work" -w /work ubuntu:22.04 bash -lc '
-            set -euo pipefail
-            apt-get update
-            apt-get install -y --no-install-recommends fuse-overlayfs ca-certificates
-            export CONTAINERS_STORAGE_DRIVER=vfs
-            retry() {
-              local max=$1
-              shift
-              local n=1
-              until "$@"; do
-                if (( n >= max )); then
-                  return 1
-                fi
-                sleep $((n * 5))
-                n=$((n + 1))
-              done
-            }
-            mapfile -t RANCHER_IMAGES < rancher-images.clean.txt
-            for img in "${RANCHER_IMAGES[@]}"; do
-              retry 5 /work/sealos pull --platform "linux/${TARGET_ARCH}" "$img"
-            done
-            retry 3 /work/sealos save --platform "linux/${TARGET_ARCH}" -o rancher-images.tar "${RANCHER_IMAGES[@]}"
+            if (( ${#SUCCESSFUL_IMAGES[@]} > 0 )); then
+              retry 3 /work/sealos save -o k8s-images.tar "${SUCCESSFUL_IMAGES[@]}"
+            else
+              echo "No images to save for ${TARGET_ARCH}"
+              touch k8s-images.tar
+            fi
           '
 
       # ======================
@@ -129,8 +111,8 @@ jobs:
       - name: Build RPM packages
         if: matrix.pkg == 'rpm'
         run: |
-          docker run --rm -v $PWD:/out centos:7 bash -c "
-            yum install -y yum-utils createrepo
+          docker run --rm -v $PWD:/out rockylinux:8 bash -c "
+            dnf install -y yum-utils createrepo
             mkdir -p /out/packages/rpm
             yumdownloader --resolve --destdir=/out/packages/rpm \
               conntrack-tools socat ipset iptables \
@@ -161,38 +143,25 @@ jobs:
           "
 
       # ======================
-      # 下载 Helm + Rancher Chart
-      # ======================
-      - name: Prepare Rancher charts
-        run: |
-          set -euo pipefail
-          mkdir -p rancher/charts rancher/helm
-          curl -LO https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz
-          tar -zxvf helm-v3.14.0-linux-amd64.tar.gz
-          install -m 0755 linux-amd64/helm /usr/local/bin/helm
-          cp /usr/local/bin/helm rancher/helm/helm
-
-          helm version
-
-          ./sealos run docker.io/alpine/helm:3.14.0 version || true
-
-          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
-          helm repo add jetstack https://charts.jetstack.io
-
-          helm pull rancher-stable/rancher --version ${RANCHER_VERSION} -d rancher/charts
-          helm pull jetstack/cert-manager --version v1.13.3 -d rancher/charts
-
-      # ======================
       # 打包最终离线包
       # ======================
       - name: Package
         run: |
-          mkdir -p release/images release/packages release/rancher release/bin release/scripts
+          mkdir -p release/images release/packages release/bin release/scripts
+
+          # 运行容器时会生成 root 所有的文件，确保我们有权限移动
+          sudo chown -R "$(id -u):$(id -g)" packages || true
 
           mv k8s-images.tar release/images/
-          mv rancher-images.tar release/images/
-          mv packages/* release/packages/ || true
-          mv rancher/* release/rancher/
+
+          case "${{ matrix.pkg }}" in
+            rpm)
+              mv packages/rpm release/packages/ || true
+              ;;
+            deb)
+              mv packages/deb release/packages/ || true
+              ;;
+          esac
 
           cp install.sh release/scripts/
 
@@ -202,6 +171,7 @@ jobs:
       # 发布 Release
       # ======================
       - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz

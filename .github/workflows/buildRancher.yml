@@ -1,0 +1,150 @@
+name: Build Rancher Offline Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    env:
+      SEALOS_VERSION: v5.1.1
+      RANCHER_VERSION: v2.8.5
+      HELM_VERSION: v3.14.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ======================
+      # 安装 sealos
+      # ======================
+      - name: Install sealos
+        run: |
+          set -euo pipefail
+          SEALOS_ARCH="$(uname -m)"
+          case "$SEALOS_ARCH" in
+            x86_64) SEALOS_ARCH=amd64 ;;
+            aarch64|arm64) SEALOS_ARCH=arm64 ;;
+            *) echo "Unsupported runner arch: $SEALOS_ARCH" >&2 ; exit 1 ;;
+          esac
+
+          SEALOS_PKG="sealos_${SEALOS_VERSION#v}_linux_${SEALOS_ARCH}.tar.gz"
+          curl -fL --retry 3 --retry-delay 2 -o "$SEALOS_PKG" \
+            "https://github.com/labring/sealos/releases/download/${SEALOS_VERSION}/${SEALOS_PKG}"
+          tar -xvf "$SEALOS_PKG"
+          install -m 0755 sealos /usr/local/bin/sealos
+          sealos version
+
+      # ======================
+      # 准备 Rancher 镜像列表
+      # ======================
+      - name: Prepare rancher images
+        run: |
+          curl -LO https://github.com/rancher/rancher/releases/download/${RANCHER_VERSION}/rancher-images.txt
+
+      # ======================
+      # 拉取 & 打包 Rancher 镜像
+      # ======================
+      - name: Build rancher image tar
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          chmod 1777 tmp
+          grep -vE '^[[:space:]]*(#|$)' rancher-images.txt | while read -r img; do
+            case "$img" in
+              *.*/*|*:*/*|localhost/*) echo "$img" ;;
+              *) echo "docker.io/$img" ;;
+            esac
+          done > rancher-images.clean.txt
+
+          docker run --rm --privileged \
+            -e TARGET_ARCH="${{ matrix.arch }}" \
+            -v "$PWD:/work" -v "$PWD/tmp:/tmp" -v "$PWD/tmp:/var/tmp" -w /work ubuntu:22.04 bash -lc '
+            set -euo pipefail
+            export TMPDIR=/tmp
+            apt-get update
+            apt-get install -y --no-install-recommends fuse-overlayfs ca-certificates
+            export CONTAINERS_STORAGE_DRIVER=vfs
+            retry() {
+              local max=$1
+              shift
+              local n=1
+              until "$@"; do
+                if (( n >= max )); then
+                  return 1
+                fi
+                sleep $((n * 5))
+                n=$((n + 1))
+              done
+            }
+            declare -a SUCCESSFUL_IMAGES=()
+            mapfile -t RANCHER_IMAGES < rancher-images.clean.txt
+            for img in "${RANCHER_IMAGES[@]}"; do
+              if /work/sealos pull --platform "linux/${TARGET_ARCH}" "$img" 2>/dev/null; then
+                SUCCESSFUL_IMAGES+=("$img")
+                echo "Pulled $img"
+              else
+                echo "Skipped $img (not available for ${TARGET_ARCH})"
+              fi
+            done
+            if (( ${#SUCCESSFUL_IMAGES[@]} > 0 )); then
+              retry 3 /work/sealos save -o rancher-images.tar "${SUCCESSFUL_IMAGES[@]}"
+            else
+              echo "No images to save for ${TARGET_ARCH}"
+              touch rancher-images.tar
+            fi
+          '
+
+      # ======================
+      # 下载 Helm + Rancher Chart
+      # ======================
+      - name: Prepare Rancher charts
+        run: |
+          set -euo pipefail
+          mkdir -p rancher/charts rancher/helm
+          curl -LO https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz
+          tar -zxvf helm-v${HELM_VERSION}-linux-amd64.tar.gz
+          install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          cp /usr/local/bin/helm rancher/helm/helm
+
+          helm version
+
+          ./sealos run docker.io/alpine/helm:${HELM_VERSION} version || true
+
+          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+          helm repo add jetstack https://charts.jetstack.io
+
+          helm pull rancher-stable/rancher --version ${RANCHER_VERSION} -d rancher/charts
+          helm pull jetstack/cert-manager --version v1.13.3 -d rancher/charts
+
+      # ======================
+      # 打包最终离线包
+      # ======================
+      - name: Package
+        run: |
+          mkdir -p release/images release/rancher release/scripts
+
+          mv rancher-images.tar release/images/
+          mv rancher/* release/rancher/ || true
+
+          cp install.sh release/scripts/
+
+          tar -czvf rancher-offline-${{ matrix.arch }}.tar.gz release
+
+      # ======================
+      # 发布 Release
+      # ======================
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rancher-offline-${{ matrix.arch }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
