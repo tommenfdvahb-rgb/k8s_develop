@@ -45,10 +45,10 @@ jobs:
       - name: Prepare k8s images
         run: |
           cat <<EOF > k8s-images.txt
-          docker.io/labring/kubernetes:${K8S_VERSION}
-          docker.io/labring/calico:${CALICO_VERSION}
-          docker.io/labring/ingress-nginx:${INGRESS_VERSION}
-          docker.io/labring/longhorn:${LONGHORN_VERSION}
+          registry.cn-shanghai.aliyuncs.com/labring/kubernetes:${K8S_VERSION}
+          registry.cn-shanghai.aliyuncs.com/labring/calico:${CALICO_VERSION}
+          registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:${INGRESS_VERSION}
+          registry.cn-shanghai.aliyuncs.com/labring/longhorn:${LONGHORN_VERSION}
           EOF
 
       # ======================
