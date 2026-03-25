@@ -81,15 +81,19 @@ jobs:
       - name: Build DEB packages
         run: |
           docker run --rm -v $(pwd):/out ubuntu:24.04 bash -c '
+            set -e
             apt-get update -qq
             apt-get install -y dpkg-dev
             mkdir -p /out/release/packages/deb
-            cd /out/release/packages/deb
+
+            # 下载 .deb（包含依赖）到 apt 缓存
             apt-get --download-only install -y \
               conntrack socat ipset iptables \
               nfs-common open-iscsi iproute2 netcat-openbsd \
               tar coreutils util-linux procps openssh-client
-            dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
+
+            # 将下载的 .deb 复制到输出目录（不生成 Packages.gz）
+            cp /var/cache/apt/archives/*.deb /out/release/packages/deb/ || true
           '
 
       # ====================== 5. 最终打包 ======================

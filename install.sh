@@ -46,42 +46,6 @@ require_cmds() {
 	done
 }
 
-# 确保 sshpass 可用：若缺失且使用密码认证，交互式提示安装
-ensure_sshpass() {
-	if command -v sshpass >/dev/null 2>&1; then
-		return 0
-	fi
-	if [[ -z "$PASSWORD" ]]; then
-		warn "sshpass 未安装，且未设置 PASSWORD，假定使用密钥登录，跳过 sshpass"
-		return 0
-	fi
-	if [[ -t 0 ]]; then
-		read -rp "缺少 sshpass，用于密码登录，是否现在尝试自动安装? [Y/n]: " _ans
-		_ans="${_ans:-Y}"
-		if [[ "${_ans,,}" =~ ^y ]]; then
-			detect_package_manager
-			case "$PKG_MANAGER" in
-				apt)
-					run_cmd apt-get update || true
-					run_cmd apt-get install -y sshpass || true
-					;;
-				yum|dnf)
-					run_cmd $PKG_MANAGER install -y sshpass || true
-					;;
-				*)
-					warn "无法自动安装 sshpass，请手动安装后重试"
-					return 1
-					;;
-			esac
-			command -v sshpass >/dev/null 2>&1 || die "sshpass 安装失败，请手动安装"
-			return 0
-		else
-			die "需要 sshpass 才能使用密码认证的远程操作，请安装或清空 PASSWORD 使用密钥登录"
-		fi
-	else
-		die "缺少 sshpass 且无法交互，请先安装 sshpass 或清空 PASSWORD 使用密钥登录"
-	fi
-}
 
 load_config_file() {
 	[[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]] && return 0
@@ -113,134 +77,6 @@ init_action() {
 	# 强制使用菜单为默认入口（不从外部 ACTION 覆盖）
 	ACTION="menu"
 }
-
-prompt_input() {
-	local __var="$1"
-	local prompt="$2"
-	local default="${3-}"
-	local secret="${4:-0}"
-	local value=""
-	local prompt_text="$prompt"
-	if [[ "$secret" != "1" && -n "$default" ]]; then
-		prompt_text="$prompt [$default]"
-	fi
-	if [[ "$secret" == "1" ]]; then
-		read -rsp "$prompt_text: " value
-		echo
-	else
-		read -rp "$prompt_text: " value
-	fi
-	value="${value:-$default}"
-	printf -v "$__var" '%s' "$value"
-}
-
-prompt_required() {
-	local __var="$1"
-	local prompt="$2"
-	local default="${3-}"
-	local secret="${4:-0}"
-	local value=""
-	while true; do
-		if [[ "$secret" == "1" ]]; then
-			read -rsp "$prompt${default:+ [$default]}: " value
-			echo
-		else
-			read -rp "$prompt${default:+ [$default]}: " value
-		fi
-		value="${value:-$default}"
-		if [[ -n "$value" ]]; then
-			printf -v "$__var" '%s' "$value"
-			return 0
-		fi
-		warn "该项不能为空"
-	done
-}
-
-prompt_yes_no() {
-	local __var="$1"
-	local prompt="$2"
-	local default="${3:-y}"
-	local answer=""
-	local suffix="y/N"
-	if [[ "${default,,}" == "y" ]]; then
-		suffix="Y/n"
-		default="y"
-	else
-		suffix="y/N"
-		default="n"
-	fi
-	while true; do
-		read -rp "$prompt ($suffix): " answer
-		answer="${answer:-$default}"
-		case "${answer,,}" in
-			y|yes) printf -v "$__var" '1'; return 0 ;;
-			n|no) printf -v "$__var" '0'; return 0 ;;
-			*) warn "请输入 y 或 n" ;;
-		esac
-	done
-}
-
-escape_env_value() {
-	local value="$1"
-	if [[ "$value" == *[[:space:]]* || "$value" == *"#"* || "$value" == *";"* ]]; then
-		value="${value//\"/\\\"}"
-		printf '"%s"' "$value"
-	else
-		printf '%s' "$value"
-	fi
-}
-
-write_config_line() {
-	local key="$1"
-	local value="$2"
-	printf '%s=%s\n' "$key" "$(escape_env_value "$value")"
-}
-
-save_config_file() {
-	local target="$1"
-	{
-		echo "# 基础必填"
-		write_config_line MASTERS "$MASTERS"
-		[[ -n "$NODES" ]] && write_config_line NODES "$NODES"
-		[[ -n "$PASSWORD" ]] && write_config_line PASSWORD "$PASSWORD"
-		[[ "$PORT" != "22" ]] && write_config_line PORT "$PORT"
-		[[ "$SSH_USER" != "root" ]] && write_config_line SSH_USER "$SSH_USER"
-		echo
-		echo "# Rancher(可选)"
-		[[ "$SKIP_RANCHER" != "0" ]] && write_config_line SKIP_RANCHER "$SKIP_RANCHER"
-		if [[ "$SKIP_RANCHER" != "1" ]]; then
-			[[ "$RANCHER_HOSTNAME" != "rancher.local" ]] && write_config_line RANCHER_HOSTNAME "$RANCHER_HOSTNAME"
-			[[ "$RANCHER_NAMESPACE" != "cattle-system" ]] && write_config_line RANCHER_NAMESPACE "$RANCHER_NAMESPACE"
-			[[ -n "$RANCHER_CHART_DIR" ]] && write_config_line RANCHER_CHART_DIR "$RANCHER_CHART_DIR"
-		fi
-		echo
-		echo "# hosts/主机名(可选)"
-		:
-		echo
-		echo "# 其他"
-		:
-	} > "$target"
-}
-
-prompt_action() {
-	local value=""
-	local default_action="${ACTION:-full}"
-	if [[ "$default_action" == "menu" || "$default_action" == "wizard" ]]; then
-		default_action="full"
-	fi
-	while true; do
-		read -rp "选择部署动作 [full/simple/rancher/precheck/postcheck/hosts/menu] (默认 $default_action): " value
-		value="${value:-$default_action}"
-		case "$value" in
-			menu|full|simple|rancher|precheck|postcheck|hosts|k8s|all)
-				ACTION="$value"
-				return 0
-				;;
-			*) warn "无效动作: $value" ;;
-		esac
-	done
-}
-
 
 detect_package_manager() {
 	if command -v yum >/dev/null; then
@@ -286,25 +122,46 @@ install_deps() {
 	detect_package_manager
 	case "$PKG_MANAGER" in
 		yum|dnf)
+		if [[ -d "$PKG_DIR" ]] && compgen -G "$PKG_DIR/*.deb" >/dev/null 2>&1; then
+			log "检测到离线 .deb 包，使用 dpkg 本地安装"
+			# 依次尝试安装所有 .deb，可能会遇到依赖顺序问题，保持容错
+			run_cmd dpkg -i "$PKG_DIR"/*.deb || true
+			# 尝试修复并配置已解包但未配置的包
+			run_cmd dpkg --configure -a || true
+		else
 			run_cmd $PKG_MANAGER install -y \
 				conntrack \
 				socat \
 				ipset \
 				iptables \
+				sshpass \
 				nfs-utils \
 				iscsi-initiator-utils \
 				iproute || true
+		fi
 			;;
 		apt)
-			run_cmd apt-get update || true
+		run_cmd apt-get update || true
+		# 如果存在离线 deb 包目录，则优先使用 dpkg 本地安装（方案 B）
+		PKG_DIR="$SCRIPT_DIR/../packages/deb"
+		if [[ -d "$PKG_DIR" ]] && compgen -G "$PKG_DIR/*.deb" >/dev/null 2>&1; then
+			log "检测到离线 .deb 包，使用 dpkg 本地安装"
+			# 依次尝试安装所有 .deb，可能会遇到依赖顺序问题，保持容错
+			run_cmd dpkg -i "$PKG_DIR"/*.deb || true
+			# 尝试修复并配置已解包但未配置的包
+			run_cmd dpkg --configure -a || true
+		else
 			run_cmd apt-get install -y \
 				conntrack \
 				socat \
 				ipset \
 				iptables \
 				nfs-common \
+				nfs-utils \
+				sshpass \
 				open-iscsi \
 				iproute2 || true
+		fi
 			;;
 		*)
 			warn "未识别包管理器，请手动安装依赖"
@@ -507,7 +364,6 @@ remote_exec() {
 	[[ "$DRY_RUN" == "1" ]] && return 0
 	local ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$PORT" "${SSH_USER}@${host}")
 	if [[ -n "$PASSWORD" ]]; then
-		ensure_sshpass
 		ssh_cmd=(sshpass -p "$PASSWORD" "${ssh_cmd[@]}")
 	fi
 	"${ssh_cmd[@]}" "$@"
@@ -656,9 +512,6 @@ configure_hosts() {
 
 	if ((${#remote_hosts[@]} > 0)); then
 		require_cmds ssh
-		if [[ -n "$PASSWORD" ]]; then
-			ensure_sshpass
-		fi
 		check_ssh "$(IFS=','; echo "${remote_hosts[*]}")" "$PORT"
 
 		local host
