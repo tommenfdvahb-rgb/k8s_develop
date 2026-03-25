@@ -46,7 +46,6 @@ jobs:
             pkg: "dnf"
 
     env:
-      SEALOS_VERSION: 5.1.1
       K8S_VERSION: v1.30.14
 
     steps:
@@ -56,12 +55,12 @@ jobs:
       # 1. 安装 sealos
       - name: Install sealos
         run: |
-          curl -sL https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/sealos_${SEALOS_VERSION}_linux_${{ matrix.arch }}.tar.gz | tar -xz sealos
+          curl -sL https://github.com/labring/sealos/releases/download/v5.1.1/sealos_5.1.1_linux_${{ matrix.arch }}.tar.gz | tar -xz sealos
           chmod +x sealos
           sudo mv sealos /usr/local/bin/
           # 把 sealos 复制到最终离线包目录（关键！）
           cp /usr/local/bin/sealos release/bin/sealos
-          echo "Sealos ${SEALOS_VERSION} (${{ matrix.arch }}) prepared"
+          echo "Sealos 5.1.1 (${{ matrix.arch }}) prepared"
 
       # 2. 拉取镜像并打包（已解决权限问题）
       - name: Pull and save k8s images
@@ -112,7 +111,7 @@ jobs:
           mkdir -p release/scripts
           cp install.sh k8s.env release/scripts/ 2>/dev/null || true
           echo "${K8S_VERSION}" > release/version.txt
-          echo "${SEALOS_VERSION}" > release/bin/sealos-version.txt
+          echo "5.1.1" > release/bin/sealos-version.txt
           tar -czf k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz -C release .
           ls -lh *.tar.gz
 
