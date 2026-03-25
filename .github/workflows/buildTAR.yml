@@ -1,8 +1,7 @@
 name: Build K8s Offline Package
 
-# ==================== 最外层权限声明（推荐写在这里） ====================
 permissions:
-  contents: write     # 允许上传 Release 和附件
+  contents: write
 
 on:
   workflow_dispatch:
@@ -16,7 +15,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
 
-    # matrix 定义保持不变
     strategy:
       fail-fast: false
       matrix:
@@ -51,38 +49,19 @@ jobs:
 
       - name: Prepare release directories
         run: |
-          mkdir -p release/bin release/images release/packages release/scripts || true
-          echo "Prepared release directories"
+          mkdir -p release/bin release/images release/packages/deb release/packages/rpm release/scripts
 
-      # 1. 安装 sealos（保证在 release/bin 中可用）
-      - name: Install sealos
+      # ====================== 1. 准备 sealos ======================
+      - name: Prepare sealos
         run: |
           SEALOS_VERSION=5.1.1
-          PKG_FILE=sealos_${SEALOS_VERSION}_linux_${{ matrix.arch }}.tar.gz
-          URL=https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/${PKG_FILE}
-
-          # 安装 curl/wget（若不存在）
-          if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-            if [ "${{ matrix.pkg }}" = "apt" ]; then
-              sudo apt-get update -qq && sudo apt-get install -y curl || true
-            else
-              sudo dnf install -y curl || true
-            fi
-          fi
-
-          # 下载并解压 sealos 到 release/bin
-          mkdir -p release/bin
-          if command -v curl >/dev/null 2>&1; then
-            curl -sL "$URL" | tar -xzf - sealos || (echo "curl download failed" && exit 1)
-          else
-            wget -qO- "$URL" | tar -xzf - sealos || (echo "wget download failed" && exit 1)
-          fi
+          curl -sL https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/sealos_${SEALOS_VERSION}_linux_${{ matrix.arch }}.tar.gz \
+            | tar -xzf - sealos
           chmod +x sealos
-          mkdir -p release/bin
-          cp -f sealos release/bin/sealos
-          echo "Sealos ${SEALOS_VERSION} (${{ matrix.arch }}) prepared in release/bin"
+          cp sealos release/bin/sealos
+          echo "Sealos ${SEALOS_VERSION} (${{ matrix.arch }}) prepared"
 
-      # 2. 拉取镜像并打包（已解决权限问题）
+      # ====================== 2. 拉取镜像（关键修复） ======================
       - name: Pull and save k8s images
         run: |
           cat > images.txt <<EOF
@@ -92,19 +71,30 @@ jobs:
           registry.cn-shanghai.aliyuncs.com/labring/longhorn:v1.6.4
           EOF
 
-          mkdir -p release/images release/packages
-
           docker run --rm \
-            -u $(id -u):$(id -g) \
             -v $(pwd):/work \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             ubuntu:22.04 bash -c '
-              apt-get update -qq && apt-get install -y ca-certificates
+              set -e
+              apt-get update -qq && apt-get install -y ca-certificates curl
+
+              # 修复 apt 权限问题（虽然这里以 root 运行，但保险起见）
+              mkdir -p /var/lib/apt/lists/partial
+              chmod 755 /var/lib/apt/lists/partial
+
               cd /work
-              ./release/bin/sealos pull --platform linux/${{ matrix.arch }} $(cat images.txt)
-              ./release/bin/sealos save -o release/images/k8s-images.tar $(cat images.txt)
+              cp release/bin/sealos /usr/local/bin/sealos
+              chmod +x /usr/local/bin/sealos
+
+              # 创建 sealos 日志目录并赋予权限
+              mkdir -p /.sealos/logs
+              chmod 777 /.sealos
+
+              /usr/local/bin/sealos pull --platform linux/${{ matrix.arch }} $(cat images.txt)
+              /usr/local/bin/sealos save -o release/images/k8s-images.tar $(cat images.txt)
             '
 
-      # 3. 下载系统依赖包（同样处理权限）
+      # ====================== 3. 下载系统依赖包 ======================
       - name: Download system dependencies
         run: |
           if [ "${{ matrix.pkg }}" = "apt" ]; then
@@ -125,17 +115,18 @@ jobs:
             '
           fi
 
-      # 4. 最终打包
+      # ====================== 4. 最终打包 ======================
       - name: Create final offline package
         run: |
           mkdir -p release/scripts
           cp install.sh k8s.env release/scripts/ 2>/dev/null || true
           echo "v1.30.14" > release/version.txt
           echo "5.1.1" > release/bin/sealos-version.txt
+
           tar -czf k8s-offline-${{ matrix.arch }}-${{ matrix.pkg }}.tar.gz -C release .
           ls -lh *.tar.gz
 
-      # 5. 发布到 GitHub Releases
+      # ====================== 5. 发布 ======================
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
