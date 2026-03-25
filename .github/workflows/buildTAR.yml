@@ -117,15 +117,10 @@ jobs:
               dnf install -y dnf-plugins-core
               mkdir -p /out/release/packages/rpm
 
-              dnf install --downloadonly --downloaddir=/out/release/packages/rpm --resolve -y \
-                conntrack-tools \
-                socat \
-                ipset \
-                iptables \
-                sshpass \
-                nfs-utils \
-                iscsi-initiator-utils \
-                iproute || true
+              dnf download --downloadonly --downloaddir=/out/release/packages/rpm \
+                --resolve --alldeps --arch=${{ env.PKG_ARCH }} -y \
+                conntrack-tools socat ipset iptables sshpass nfs-utils \
+                iscsi-initiator-utils iproute || true
 
               echo "Downloaded $(ls /out/release/packages/rpm/*.rpm 2>/dev/null | wc -l) RPM packages"
             '
