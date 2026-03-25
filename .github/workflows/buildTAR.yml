@@ -57,12 +57,11 @@ jobs:
       # 1. 安装 sealos
       - name: Install sealos
         run: |
-          curl -sL https://github.com/labring/sealos/releases/download/v5.1.1/sealos_5.1.1_linux_${{ matrix.arch }}.tar.gz | tar -xz sealos
-          chmod +x sealos
-          sudo mv sealos /usr/local/bin/
+          wget https://github.com/labring/sealos/releases/download/${VERSION}/sealos_${VERSION#v}_linux_${{ matrix.arch }}.tar.gz \
+          && tar zxvf sealos_${VERSION#v}_linux_${{ matrix.arch }}.tar.gz sealos && chmod +x sealos && mv sealos /usr/bin
           # 把 sealos 复制到最终离线包目录（关键！）
           mkdir -p release/bin
-          cp /usr/local/bin/sealos release/bin/sealos
+          cp /usr/bin/sealos release/bin/sealos
           echo "Sealos 5.1.1 (${{ matrix.arch }}) prepared"
 
       # 2. 拉取镜像并打包（已解决权限问题）
