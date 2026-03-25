@@ -78,7 +78,7 @@ jobs:
             wget -qO- "$URL" | tar -xzf - sealos || (echo "wget download failed" && exit 1)
           fi
           chmod +x sealos
-          mv -f sealos /usr/bin/sealos
+          sudo mv -f sealos /usr/bin/sealos
           cp /usr/bin/sealos release/bin/sealos
           echo "Sealos ${SEALOS_VERSION} (${ { matrix.arch } }) prepared in release/bin"
 
