@@ -204,8 +204,8 @@ ensure_sealos() {
 		return
 	fi
 
-	if [[ -f ./sealos ]]; then
-		install -m 0755 ./sealos /usr/bin/sealos
+	if [[ -f ../bin/sealos ]]; then
+		install -m 0755 ../bin/sealos /usr/bin/sealos
 		command -v sealos >/dev/null || die "sealos 安装失败"
 	else
 		die "未找到 sealos 二进制，请把 sealos 放到脚本所在目录或已安装于 PATH"
