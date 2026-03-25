@@ -12,7 +12,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 简化为单一构建：amd64 + deb (apt)
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
 
     env:
       SEALOS_VERSION: 5.1.1
@@ -31,7 +34,7 @@ jobs:
       # ====================== 1. 安装 sealos ======================
       - name: Install sealos
         run: |
-          SEALOS_ARCH=amd64
+          SEALOS_ARCH=${{ matrix.arch }}
           curl -fL --retry 3 -o sealos.tar.gz \
             https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/sealos_${SEALOS_VERSION}_linux_${SEALOS_ARCH}.tar.gz
           
@@ -70,8 +73,8 @@ jobs:
               mkdir -p /.sealos/logs
               chmod 777 /.sealos
 
-              echo "=== Pulling images for linux/amd64 ==="
-              /usr/local/bin/sealos pull --platform linux/amd64 $(cat k8s-images.txt)
+              echo "=== Pulling images for linux/${{ matrix.arch }} ==="
+              /usr/local/bin/sealos pull --platform linux/${{ matrix.arch }} $(cat k8s-images.txt)
 
               echo "=== Saving images ==="
               /usr/local/bin/sealos save -o release/images/k8s-images.tar $(cat k8s-images.txt)
@@ -80,7 +83,7 @@ jobs:
       # ====================== 4. 构建系统依赖包 ======================
       - name: Build DEB packages
         run: |
-          docker run --rm -v $(pwd):/out ubuntu:24.04 bash -c '
+          docker run --platform linux/${{ matrix.arch }} --rm -v $(pwd):/out ubuntu:24.04 bash -c '
             set -e
             apt-get update -qq
             apt-get install -y dpkg-dev
@@ -104,7 +107,7 @@ jobs:
           echo "${K8S_VERSION}" > release/version.txt
           echo "${SEALOS_VERSION}" > release/bin/sealos-version.txt
 
-          tar -czf k8s-offline-amd64-deb.tar.gz -C release .
+          tar -czf k8s-offline-${{ matrix.arch }}-deb.tar.gz -C release .
           ls -lh *.tar.gz
 
       # ====================== 6. 发布 ======================
