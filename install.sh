@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-set -euo pipefail
 IFS=$'\n\t'
 
-LOG_FILE="${LOG_FILE:-/var/log/sealos-install.log}"
-DRY_RUN="${DRY_RUN:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 固定的默认配置（用户无需通过环境变量覆盖）
+OFFLINE_TAR="../images/k8s-offline.tar"
+LOG_FILE="../logs/sealos-install.log"
+DRY_RUN=0
+
+CONFIG_FILE="k8s.env"
+
+# Track env-provided vars so config file won't override them.
+declare -A ENV_SET=()
+while IFS='=' read -r env_k _; do
+	ENV_SET["$env_k"]=1
+done < <(env)
+
 
 log() { printf '[%s] %s\n' "$(date +'%F %T')" "$*"; }
 warn() { log "WARN: $*"; }
@@ -33,6 +44,38 @@ require_cmds() {
 	for cmd in "$@"; do
 		command -v "$cmd" >/dev/null || die "缺少命令: $cmd"
 	done
+}
+
+
+load_config_file() {
+	[[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]] && return 0
+	log "加载配置文件: $CONFIG_FILE"
+	local line key value
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line%%$'\r'}"
+		[[ -z "${line//[[:space:]]/}" ]] && continue
+		[[ "$line" =~ ^[[:space:]]*# ]] && continue
+		if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+			key="${BASH_REMATCH[1]}"
+			value="${BASH_REMATCH[2]}"
+			[[ "$key" == "CONFIG_FILE" ]] && continue
+			[[ -n "${ENV_SET[$key]:-}" ]] && continue
+			value="${value#"${value%%[![:space:]]*}"}"
+			value="${value%"${value##*[![:space:]]}"}"
+			if [[ "$value" =~ ^\".*\"$ ]]; then
+				value="${value:1:-1}"
+				value="${value//\\\"/\"}"
+			elif [[ "$value" =~ ^\'.*\'$ ]]; then
+				value="${value:1:-1}"
+			fi
+			printf -v "$key" '%s' "$value"
+		fi
+	done < "$CONFIG_FILE"
+}
+
+init_action() {
+	# 强制使用菜单为默认入口（不从外部 ACTION 覆盖）
+	ACTION="menu"
 }
 
 detect_package_manager() {
@@ -79,25 +122,46 @@ install_deps() {
 	detect_package_manager
 	case "$PKG_MANAGER" in
 		yum|dnf)
+		if [[ -d "$PKG_DIR" ]] && compgen -G "$PKG_DIR/*.deb" >/dev/null 2>&1; then
+			log "检测到离线 .deb 包，使用 dpkg 本地安装"
+			# 依次尝试安装所有 .deb，可能会遇到依赖顺序问题，保持容错
+			run_cmd dpkg -i "$PKG_DIR"/*.deb || true
+			# 尝试修复并配置已解包但未配置的包
+			run_cmd dpkg --configure -a || true
+		else
 			run_cmd $PKG_MANAGER install -y \
 				conntrack \
 				socat \
 				ipset \
 				iptables \
+				sshpass \
 				nfs-utils \
 				iscsi-initiator-utils \
 				iproute || true
+		fi
 			;;
 		apt)
-			run_cmd apt-get update || true
+		run_cmd apt-get update || true
+		# 如果存在离线 deb 包目录，则优先使用 dpkg 本地安装（方案 B）
+		PKG_DIR="$SCRIPT_DIR/../packages/deb"
+		if [[ -d "$PKG_DIR" ]] && compgen -G "$PKG_DIR/*.deb" >/dev/null 2>&1; then
+			log "检测到离线 .deb 包，使用 dpkg 本地安装"
+			# 依次尝试安装所有 .deb，可能会遇到依赖顺序问题，保持容错
+			run_cmd dpkg -i "$PKG_DIR"/*.deb || true
+			# 尝试修复并配置已解包但未配置的包
+			run_cmd dpkg --configure -a || true
+		else
 			run_cmd apt-get install -y \
 				conntrack \
 				socat \
 				ipset \
 				iptables \
 				nfs-common \
+				nfs-utils \
+				sshpass \
 				open-iscsi \
 				iproute2 || true
+		fi
 			;;
 		*)
 			warn "未识别包管理器，请手动安装依赖"
@@ -140,8 +204,8 @@ ensure_sealos() {
 		return
 	fi
 
-	if [[ -f ./sealos ]]; then
-		install -m 0755 ./sealos /usr/bin/sealos
+	if [[ -f ../bin/sealos ]]; then
+		install -m 0755 ../bin/sealos /usr/bin/sealos
 		command -v sealos >/dev/null || die "sealos 安装失败"
 	else
 		die "未找到 sealos 二进制，请把 sealos 放到脚本所在目录或已安装于 PATH"
@@ -149,42 +213,26 @@ ensure_sealos() {
 }
 
 # ================== 参数 ==================
-OFFLINE_TAR="${OFFLINE_TAR:-}"
 MASTERS="${MASTERS:-}"
 NODES="${NODES:-}"
 PASSWORD="${PASSWORD:-}"
 PORT="${PORT:-22}"
-ACTION="${ACTION:-}"
 SKIP_RANCHER="${SKIP_RANCHER:-0}"
 RANCHER_HOSTNAME="${RANCHER_HOSTNAME:-rancher.local}"
 RANCHER_NAMESPACE="${RANCHER_NAMESPACE:-cattle-system}"
 RANCHER_CHART_DIR="${RANCHER_CHART_DIR:-}"
-
-if [[ -z "$ACTION" ]]; then
-	if [[ -n "$OFFLINE_TAR" ]]; then
-		ACTION="full"
-	else
-		ACTION="menu"
-	fi
-fi
+SSH_USER="${SSH_USER:-root}"
 
 usage() {
 	cat <<EOF
 用法:
-OFFLINE_TAR=xxx.tar \
-MASTERS=1.1.1.1,1.1.1.2 \
-NODES=1.1.1.3 \
-PASSWORD=xxx \
-bash install.sh
+编辑 `k8s.env` 填写 MASTERS/NODES 等，或导出环境变量后运行脚本，例如：
+MASTERS=1.1.1.1,1.1.1.2 PASSWORD=xxx bash install.sh
 
-可选动作:
-ACTION=menu        # 菜单模式(默认)
-ACTION=full        # 全部部署(环境校验+依赖安装+K8s部署+Rancher)
-ACTION=simple      # 简单部署(环境校验+K8s部署)
-ACTION=rancher     # 仅安装 Rancher
-ACTION=precheck    # 仅环境校验
-ACTION=postcheck   # 仅集群后置检查
-ACTION=config      # 打印当前配置
+默认以菜单模式启动（无需设置 ACTION）。
+
+可选配置文件: CONFIG_FILE=/path/k8s.env
+hosts 条目将根据 MASTERS/NODES 自动生成并写入 /etc/hosts（无需 HOSTS_FILE）
 EOF
 	exit 1
 }
@@ -192,23 +240,299 @@ EOF
 show_config() {
 	cat <<EOF
 当前配置:
-- ACTION=$ACTION
-- OFFLINE_TAR=$OFFLINE_TAR
-- MASTERS=$MASTERS
-- NODES=$NODES
-- PORT=$PORT
-- SKIP_RANCHER=$SKIP_RANCHER
-- RANCHER_HOSTNAME=$RANCHER_HOSTNAME
-- RANCHER_NAMESPACE=$RANCHER_NAMESPACE
-- RANCHER_CHART_DIR=$RANCHER_CHART_DIR
-- LOG_FILE=$LOG_FILE
-- DRY_RUN=$DRY_RUN
+	- CONFIG_FILE=$CONFIG_FILE
+	- OFFLINE_TAR=$OFFLINE_TAR
+	- MASTERS=$MASTERS
+	- NODES=$NODES
+	- PORT=$PORT
+	- SKIP_RANCHER=$SKIP_RANCHER
+	- RANCHER_HOSTNAME=$RANCHER_HOSTNAME
+	- RANCHER_NAMESPACE=$RANCHER_NAMESPACE
+	- RANCHER_CHART_DIR=$RANCHER_CHART_DIR
+	- SSH_USER=$SSH_USER
+	- LOG_FILE=$LOG_FILE
 EOF
 }
 
 require_deploy_params() {
-	[[ -z "$OFFLINE_TAR" ]] && die "OFFLINE_TAR 不能为空"
 	[[ -z "$MASTERS" ]] && die "MASTERS 不能为空"
+}
+
+# ================== 主机名/hosts 配置 ==================
+collect_hosts() {
+	local combined=""
+	if [[ -n "$MASTERS" ]]; then
+		combined="$MASTERS"
+	fi
+	if [[ -n "$NODES" ]]; then
+		if [[ -n "$combined" ]]; then
+			combined+=",${NODES}"
+		else
+			combined="$NODES"
+		fi
+	fi
+	combined="${combined// /}"
+	echo "$combined"
+}
+
+get_hostname_for_host() {
+	local host="$1"
+	# 如果用户提供了 HOSTNAME_MAP（保留兼容），优先使用
+	if [[ -n "${HOSTNAME_MAP:-}" ]]; then
+		local pair ip name
+		IFS=',' read -ra pairs <<< "${HOSTNAME_MAP// /}"
+		for pair in "${pairs[@]}"; do
+			[[ -z "$pair" ]] && continue
+			if [[ "$pair" != *=* ]]; then
+				die "HOSTNAME_MAP 格式错误: $pair"
+			fi
+			ip="${pair%%=*}"
+			name="${pair#*=}"
+			if [[ "$ip" == "$host" ]]; then
+				echo "$name"
+				return 0
+			fi
+		done
+	fi
+	# 否则按 MASTERS/NODES 列表自动生成：单个主机使用 master/node，多主机使用 master1/master2...
+	generate_hostname_map
+	local pair ip name
+	IFS=',' read -ra pairs <<< "${HOSTNAME_MAP// /}"
+	for pair in "${pairs[@]}"; do
+		ip="${pair%%=*}"
+		name="${pair#*=}"
+		if [[ "$ip" == "$host" ]]; then
+			echo "$name"
+			return 0
+		fi
+	done
+	return 1
+}
+
+generate_hostname_map() {
+	# 如果已生成则直接返回
+	[[ -n "${HOSTNAME_MAP:-}" ]] && return 0
+	local map_list=()
+	# 生成 masters 映射
+	if [[ -n "${MASTERS:-}" ]]; then
+		IFS=',' read -ra mlist <<< "${MASTERS// /}"
+		local count=${#mlist[@]}
+		local i
+		for i in "${!mlist[@]}"; do
+			local ip=${mlist[i]}
+			if (( count == 1 )); then
+				map_list+=("${ip}=master")
+			else
+				map_list+=("${ip}=master$((i+1))")
+			fi
+		done
+	fi
+	# 生成 nodes 映射
+	if [[ -n "${NODES:-}" ]]; then
+		IFS=',' read -ra nlist <<< "${NODES// /}"
+		local ncount=${#nlist[@]}
+		local j
+		for j in "${!nlist[@]}"; do
+			local ip=${nlist[j]}
+			if (( ncount == 1 )); then
+				map_list+=("${ip}=node")
+			else
+				map_list+=("${ip}=node$((j+1))")
+			fi
+		done
+	fi
+	HOSTNAME_MAP="$(IFS=,; echo "${map_list[*]}")"
+}
+
+is_local_host() {
+	local host="$1"
+	[[ "$host" == "localhost" || "$host" == "127.0.0.1" ]] && return 0
+	[[ "$host" == "$(hostname)" ]] && return 0
+	if command -v ip >/dev/null; then
+		local ip
+		while read -r ip; do
+			[[ "$ip" == "$host" ]] && return 0
+		done < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
+	fi
+	return 1
+}
+
+remote_exec() {
+	local host="$1"
+	shift
+	log "+ [$host] $*"
+	[[ "$DRY_RUN" == "1" ]] && return 0
+	local ssh_cmd=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$PORT" "${SSH_USER}@${host}")
+	if [[ -n "$PASSWORD" ]]; then
+		ssh_cmd=(sshpass -p "$PASSWORD" "${ssh_cmd[@]}")
+	fi
+	"${ssh_cmd[@]}" "$@"
+}
+
+build_hosts_block() {
+	# 由 MASTERS/NODES 或 HOSTNAME_MAP 自动生成 hosts 块（每行: IP HOSTNAME）
+	local tmp
+	tmp="$(mktemp)"
+	: > "$tmp"
+	generate_hostname_map
+	local pair ip name
+	IFS=',' read -ra pairs <<< "${HOSTNAME_MAP// /}"
+	for pair in "${pairs[@]}"; do
+		[[ -z "$pair" ]] && continue
+		ip="${pair%%=*}"
+		name="${pair#*=}"
+		printf '%s %s\n' "$ip" "$name" >> "$tmp"
+	done
+	# 清理空行（保险）
+	awk 'NF {print $0}' "$tmp" > "${tmp}.clean"
+	mv "${tmp}.clean" "$tmp"
+	echo "$tmp"
+}
+
+apply_hosts_block_local() {
+	local block_file="$1"
+	local tmp
+	tmp="$(mktemp)"
+	# 使用 sed 删除已存在的 k8s-autoinstall 区块（更兼容不同 awk 实现）
+	sed '/^# k8s-autoinstall begin$/,/^# k8s-autoinstall end$/d' /etc/hosts > "$tmp"
+	{
+		echo "# k8s-autoinstall begin"
+		cat "$block_file"
+		echo "# k8s-autoinstall end"
+	} >> "$tmp"
+	run_cmd cp "$tmp" /etc/hosts
+	run_cmd chmod 0644 /etc/hosts
+	rm -f "$tmp"
+}
+
+apply_hosts_block_remote() {
+	local host="$1"
+	local block_file="$2"
+	remote_exec "$host" "cat > /tmp/k8s-hosts.block" < "$block_file"
+	remote_exec "$host" bash -s <<'EOF'
+set -euo pipefail
+block="/tmp/k8s-hosts.block"
+tmp="$(mktemp)"
+sed '/^# k8s-autoinstall begin$/,/^# k8s-autoinstall end$/d' /etc/hosts > "$tmp"
+{
+	echo "# k8s-autoinstall begin"
+	cat "$block"
+	echo "# k8s-autoinstall end"
+} >> "$tmp"
+cp "$tmp" /etc/hosts
+chmod 0644 /etc/hosts
+rm -f "$tmp" "$block"
+EOF
+}
+
+set_hostname_local() {
+	local name="$1"
+	if command -v hostnamectl >/dev/null; then
+		run_cmd hostnamectl set-hostname "$name"
+	else
+		run_cmd hostname "$name"
+		echo "$name" > /etc/hostname || true
+	fi
+}
+
+set_hostname_remote() {
+	local host="$1"
+	local name="$2"
+	remote_exec "$host" env NEW_HOSTNAME="$name" bash -s <<'EOF'
+set -euo pipefail
+name="${NEW_HOSTNAME:?}"
+if command -v hostnamectl >/dev/null 2>&1; then
+	hostnamectl set-hostname "$name"
+else
+	hostname "$name"
+	echo "$name" > /etc/hostname
+fi
+EOF
+}
+
+configure_hosts() {
+	local need_hosts=0
+	local need_hostname=0
+	# 总是根据 MASTERS/NODES 生成并更新 hosts 与主机名（若未提供则跳过）
+	if [[ -n "$MASTERS" || -n "$NODES" ]]; then
+		need_hostname=1
+		need_hosts=1
+	fi
+	if (( need_hosts == 0 && need_hostname == 0 )); then
+		log "未提供 MASTERS/NODES，跳过主机名/hosts 配置"
+		return 0
+	fi
+
+	local host_list
+	host_list="$(collect_hosts)"
+	if [[ -z "$host_list" ]]; then
+		log "未设置 MASTERS/NODES，仅在本机应用 hosts/主机名"
+	fi
+
+	local block_file=""
+	if (( need_hosts == 1 )); then
+		block_file="$(build_hosts_block)"
+		[[ -s "$block_file" ]] || die "hosts 内容为空，请检查 MASTERS/NODES"
+	fi
+
+	local local_host=""
+	local remote_hosts=()
+	if [[ -n "$host_list" ]]; then
+		local host
+		IFS=',' read -ra hosts <<< "$host_list"
+		for host in "${hosts[@]}"; do
+			[[ -z "$host" ]] && continue
+			if is_local_host "$host"; then
+				local_host="$host"
+			else
+				remote_hosts+=("$host")
+			fi
+		done
+	fi
+
+	if (( need_hosts == 1 )); then
+		if [[ -n "$local_host" || -z "$host_list" ]]; then
+			log "更新本机 /etc/hosts"
+			apply_hosts_block_local "$block_file"
+		fi
+	fi
+
+	if (( need_hostname == 1 )); then
+		generate_hostname_map
+		if [[ -n "$local_host" ]]; then
+			local local_name
+			if local_name="$(get_hostname_for_host "$local_host")"; then
+				log "设置本机主机名: $local_name"
+				set_hostname_local "$local_name"
+			else
+				warn "无法为本机生成主机名: $local_host"
+			fi
+		fi
+	fi
+
+	if ((${#remote_hosts[@]} > 0)); then
+		require_cmds ssh
+		check_ssh "$(IFS=','; echo "${remote_hosts[*]}")" "$PORT"
+
+		local host
+		for host in "${remote_hosts[@]}"; do
+			if (( need_hosts == 1 )); then
+				log "更新远程 /etc/hosts: $host"
+				apply_hosts_block_remote "$host" "$block_file"
+			fi
+			if (( need_hostname == 1 )); then
+				local name
+				if name="$(get_hostname_for_host "$host")"; then
+					log "设置远程主机名: $host => $name"
+					set_hostname_remote "$host" "$name"
+				else
+					warn "无法为远程主机生成主机名: $host"
+				fi
+			fi
+		done
+	fi
+
+	[[ -n "$block_file" ]] && rm -f "$block_file"
 }
 
 deploy_k8s() {
@@ -285,22 +609,18 @@ install_rancher() {
 	log "Rancher 安装命令已执行，建议检查: kubectl get pods -n $RANCHER_NAMESPACE"
 }
 
-full_deploy() {
-	precheck
-	install_deps
-	deploy_k8s
-	post_check
-
-	if [[ "$SKIP_RANCHER" != "1" ]]; then
-		install_rancher
-	else
-		log "SKIP_RANCHER=1，跳过 Rancher 安装"
-	fi
-}
-
 simple_deploy() {
+	echo "执行完整部署流程: 环境检查 + 依赖安装 + 主机名/hosts 配置 + K8s 部署 + 集群状态检查"
+	echo "组件存在：kubernetes:v1.30.14，calico:v3.27.4，Longhorn:v1.6.4，ingress-nginx:v1.11.3"
+    #环境检查
 	precheck
+    #依赖安装
+	install_deps
+    #更新hosts
+	configure_hosts
+    #开始部署
 	deploy_k8s
+    #检查集群状态
 	post_check
 }
 
@@ -308,12 +628,12 @@ print_menu() {
 	cat <<EOF
 
 ================= 部署菜单 =================
-1) 全部部署 (环境校验 + 依赖安装 + K8s + Rancher)
-2) 简单部署 (环境校验 + K8s)
-3) 安装 Rancher
-4) 环境校验
-5) 集群后置检查
-6) 显示当前配置
+1) 集群部署 (环境校验 + 依赖安装 + K8s)
+2) 安装 Rancher
+3) 环境校验
+4) 集群后置检查
+5) 显示当前配置
+6) 配置 hosts/主机名
 0) 退出
 ===========================================
 EOF
@@ -324,33 +644,35 @@ menu_mode() {
 		print_menu
 		read -rp "请输入菜单编号: " choice
 		case "$choice" in
-			1) full_deploy ;;
-			2) simple_deploy ;;
-			3) install_rancher ;;
-			4) precheck ;;
-			5) post_check ;;
-			6) show_config ;;
+			1) simple_deploy ;;
+			2) install_rancher ;;
+			3) precheck ;;
+			4) post_check ;;
+			5) show_config ;;
+			6) configure_hosts ;;
 			0) log "退出"; break ;;
 			*) warn "无效选项: $choice" ;;
 		esac
 	done
 }
-
 run_action() {
 	case "$ACTION" in
 		menu) menu_mode ;;
+		wizard) wizard_mode ;;
 		full|all) full_deploy ;;
 		simple|k8s) simple_deploy ;;
 		rancher) install_rancher ;;
 		precheck|check) precheck ;;
 		postcheck) post_check ;;
+		hosts) configure_hosts ;;
 		config) show_config ;;
 		*) usage ;;
 	esac
 }
-
 # ================== 主流程 ==================
 main() {
+	load_config_file
+	init_action
 	require_root
 	require_cmds tar awk timeout
 	run_action
