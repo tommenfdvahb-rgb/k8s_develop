@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 固定的默认配置（用户无需通过环境变量覆盖）
-OFFLINE_TAR="${OFFLINE_TAR:-$SCRIPT_DIR/../images/k8s-images.tar}"
-LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/../logs/sealos-install.log}"
+OFFLINE_TAR="../images/k8s-offline.tar"
+LOG_FILE="../logs/sealos-install.log"
 DRY_RUN=0
 
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/k8s.env}"
+CONFIG_FILE="k8s.env"
 
 # Track env-provided vars so config file won't override them.
 declare -A ENV_SET=()
@@ -242,65 +241,6 @@ prompt_action() {
 	done
 }
 
-interactive_config() {
-	log "进入交互式配置..."
-	local current_log="$LOG_FILE"
-
-	prompt_action
-
-	case "$ACTION" in
-		full|all|simple|k8s)
-			prompt_required MASTERS "Master IP 列表(逗号分隔)" "$MASTERS"
-			prompt_input NODES "Worker IP 列表(逗号分隔，可空)" "$NODES"
-			;;
-		esac
-
-	case "$ACTION" in
-		full|all|simple|k8s|hosts)
-			prompt_input PORT "SSH 端口" "$PORT"
-			prompt_input SSH_USER "SSH 用户" "$SSH_USER"
-			prompt_input PASSWORD "SSH 密码(留空使用密钥)" "$PASSWORD" 1
-			;;
-		esac
-
-	local do_hosts="0"
-	prompt_yes_no do_hosts "是否配置 /etc/hosts 与主机名" "n"
-	if [[ "$do_hosts" == "1" ]]; then
-		# 将根据 MASTERS/NODES 自动生成 hosts 条目并写入 /etc/hosts
-		:
-	fi
-
-	if [[ "$ACTION" == "full" || "$ACTION" == "all" || "$ACTION" == "rancher" ]]; then
-		if [[ "$ACTION" != "rancher" ]]; then
-			local skip_default="n"
-			[[ "$SKIP_RANCHER" == "1" ]] && skip_default="y"
-			prompt_yes_no SKIP_RANCHER "是否跳过 Rancher 安装" "$skip_default"
-		else
-			SKIP_RANCHER=0
-		fi
-		if [[ "$SKIP_RANCHER" != "1" ]]; then
-			prompt_input RANCHER_HOSTNAME "Rancher 域名" "$RANCHER_HOSTNAME"
-			prompt_input RANCHER_NAMESPACE "Rancher 命名空间" "$RANCHER_NAMESPACE"
-			prompt_input RANCHER_CHART_DIR "本地 Rancher chart 目录(可空)" "$RANCHER_CHART_DIR"
-		fi
-	fi
-
-
-
-	show_config
-
-	local save_config="0"
-	prompt_yes_no save_config "是否保存配置到 $CONFIG_FILE" "y"
-	if [[ "$save_config" == "1" ]]; then
-		save_config_file "$CONFIG_FILE"
-		log "配置已保存: $CONFIG_FILE"
-	fi
-}
-
-wizard_mode() {
-	interactive_config
-	run_action
-}
 
 detect_package_manager() {
 	if command -v yum >/dev/null; then
@@ -816,25 +756,18 @@ install_rancher() {
 	log "Rancher 安装命令已执行，建议检查: kubectl get pods -n $RANCHER_NAMESPACE"
 }
 
-full_deploy() {
-	precheck
-	configure_hosts
-	install_deps
-	deploy_k8s
-	post_check
-
-	if [[ "$SKIP_RANCHER" != "1" ]]; then
-		install_rancher
-	else
-		log "SKIP_RANCHER=1，跳过 Rancher 安装"
-	fi
-}
-
 simple_deploy() {
+	echo "执行完整部署流程: 环境检查 + 依赖安装 + 主机名/hosts 配置 + K8s 部署 + 集群状态检查"
+	echo "组件存在：kubernetes:v1.30.14，calico:v3.27.4，Longhorn:v1.6.4，ingress-nginx:v1.11.3"
+    #环境检查
 	precheck
+    #依赖安装
 	install_deps
+    #更新hosts
 	configure_hosts
+    #开始部署
 	deploy_k8s
+    #检查集群状态
 	post_check
 }
 
@@ -842,14 +775,12 @@ print_menu() {
 	cat <<EOF
 
 ================= 部署菜单 =================
-1) 全部部署 (环境校验 + 依赖安装 + K8s + Rancher)
-2) 简单部署 (环境校验 + 依赖安装 + K8s)
-3) 安装 Rancher
-4) 环境校验
-5) 集群后置检查
-6) 显示当前配置
-7) 配置 hosts/主机名
-8) 交互式配置并执行
+1) 集群部署 (环境校验 + 依赖安装 + K8s)
+2) 安装 Rancher
+3) 环境校验
+4) 集群后置检查
+5) 显示当前配置
+6) 配置 hosts/主机名
 0) 退出
 ===========================================
 EOF
@@ -860,20 +791,17 @@ menu_mode() {
 		print_menu
 		read -rp "请输入菜单编号: " choice
 		case "$choice" in
-			1) full_deploy ;;
-			2) simple_deploy ;;
-			3) install_rancher ;;
-			4) precheck ;;
-			5) post_check ;;
-			6) show_config ;;
-			7) configure_hosts ;;
-			8) wizard_mode ;;
+			1) simple_deploy ;;
+			2) install_rancher ;;
+			3) precheck ;;
+			4) post_check ;;
+			5) show_config ;;
+			6) configure_hosts ;;
 			0) log "退出"; break ;;
 			*) warn "无效选项: $choice" ;;
 		esac
 	done
 }
-
 run_action() {
 	case "$ACTION" in
 		menu) menu_mode ;;
@@ -888,7 +816,6 @@ run_action() {
 		*) usage ;;
 	esac
 }
-
 # ================== 主流程 ==================
 main() {
 	load_config_file
