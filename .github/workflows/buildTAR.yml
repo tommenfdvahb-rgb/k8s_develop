@@ -49,6 +49,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Prepare release directories
+        run: |
+          mkdir -p release/bin release/images release/packages release/scripts || true
+          echo "Prepared release directories"
+
       # 1. 安装 sealos
       - name: Install sealos
         run: |
@@ -56,6 +61,7 @@ jobs:
           chmod +x sealos
           sudo mv sealos /usr/local/bin/
           # 把 sealos 复制到最终离线包目录（关键！）
+          mkdir -p release/bin
           cp /usr/local/bin/sealos release/bin/sealos
           echo "Sealos 5.1.1 (${{ matrix.arch }}) prepared"
 
