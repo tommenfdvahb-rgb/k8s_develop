@@ -11,11 +11,18 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        arch: [ ubuntu-24.04, ubuntu-24.04-arm ]
+        base_image: [ rocky9, ubuntu24.04 ]
+
+    runs-on: ${{ matrix.arch }}
+
+    # 并发控制，避免相同组合重复跑
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.arch }}-${{ matrix.base_image }}
+      cancel-in-progress: true
 
     env:
       SEALOS_VERSION: 5.1.1
@@ -23,6 +30,8 @@ jobs:
       CALICO_VERSION: v3.27.4
       INGRESS_VERSION: v1.11.3
       LONGHORN_VERSION: v1.6.4
+      # 新增：根据 matrix 动态映射平台
+      PLATFORM: ${{ matrix.arch == 'ubuntu-24.04' && 'linux/amd64' || 'linux/arm64' }}
 
     steps:
       - name: Checkout code
@@ -34,14 +43,14 @@ jobs:
       # ====================== 1. 安装 sealos ======================
       - name: Install sealos
         run: |
-          SEALOS_ARCH=${{ matrix.arch }}
+          SEALOS_ARCH=${{ matrix.arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}
           curl -fL --retry 3 -o sealos.tar.gz \
             https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/sealos_${SEALOS_VERSION}_linux_${SEALOS_ARCH}.tar.gz
           
           tar -xzf sealos.tar.gz
           chmod +x sealos
           sudo install -m 0755 sealos /usr/local/bin/sealos
-          cp sealos release/bin/sealos          # 打包进离线包
+          cp sealos release/bin/sealos
           sealos version
 
       # ====================== 2. 准备镜像列表 ======================
@@ -54,7 +63,7 @@ jobs:
           registry.cn-shanghai.aliyuncs.com/labring/longhorn:${LONGHORN_VERSION}
           EOF
 
-      # ====================== 3. 拉取并打包镜像（核心修复） ======================
+      # ====================== 3. 拉取并打包镜像（关键修复） ======================
       - name: Build k8s image tar
         run: |
           docker run --rm --privileged \
@@ -69,35 +78,38 @@ jobs:
               cp release/bin/sealos /usr/local/bin/sealos
               chmod +x /usr/local/bin/sealos
 
-              # 解决 sealos 日志目录权限问题
               mkdir -p /.sealos/logs
               chmod 777 /.sealos
 
-              echo "=== Pulling images for linux/${{ matrix.arch }} ==="
-              /usr/local/bin/sealos pull --platform linux/${{ matrix.arch }} $(cat k8s-images.txt)
+              echo "=== Pulling images for ${{ env.PLATFORM }} ==="
+              /usr/local/bin/sealos pull --platform ${{ env.PLATFORM }} $(cat k8s-images.txt)
 
               echo "=== Saving images ==="
               /usr/local/bin/sealos save -o release/images/k8s-images.tar $(cat k8s-images.txt)
             '
 
-      # ====================== 4. 构建系统依赖包 ======================
-      - name: Build DEB packages
+      # ====================== 4. 构建系统依赖包（根据 base_image 区分） ======================
+      - name: Build packages
         run: |
-          docker run --platform linux/${{ matrix.arch }} --rm -v $(pwd):/out ubuntu:24.04 bash -c '
-            set -e
-            apt-get update -qq
-            apt-get install -y dpkg-dev
-            mkdir -p /out/release/packages/deb
+          if [[ "${{ matrix.base_image }}" == "ubuntu24.04" ]]; then
+            docker run --platform ${{ env.PLATFORM }} --rm -v $(pwd):/out ubuntu:24.04 bash -c '
+              set -e
+              apt-get update -qq
+              apt-get install -y dpkg-dev
+              mkdir -p /out/release/packages/deb
 
-            # 下载 .deb（包含依赖）到 apt 缓存
-            apt-get --download-only install -y \
-              conntrack socat ipset iptables \
-              nfs-common open-iscsi iproute2 netcat-openbsd \
-              tar coreutils util-linux procps openssh-client
+              apt-get --download-only install -y \
+                conntrack socat ipset iptables \
+                nfs-common open-iscsi iproute2 netcat-openbsd \
+                tar coreutils util-linux procps openssh-client
 
-            # 将下载的 .deb 复制到输出目录（不生成 Packages.gz）
-            cp /var/cache/apt/archives/*.deb /out/release/packages/deb/ || true
-          '
+              cp /var/cache/apt/archives/*.deb /out/release/packages/deb/ || true
+            '
+          else
+            # rocky9 使用 rpm（你可以后续完善 dnf 下载逻辑）
+            echo "Rocky9 RPM packaging not fully implemented yet. Skipping for now."
+            mkdir -p release/packages/rpm
+          fi
 
       # ====================== 5. 最终打包 ======================
       - name: Package offline bundle
@@ -107,7 +119,7 @@ jobs:
           echo "${K8S_VERSION}" > release/version.txt
           echo "${SEALOS_VERSION}" > release/bin/sealos-version.txt
 
-          tar -czf k8s-offline-${{ matrix.arch }}-deb.tar.gz -C release .
+          tar -czf k8s-offline-${{ matrix.base_image }}-${{ matrix.arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}.tar.gz -C release .
           ls -lh *.tar.gz
 
       # ====================== 6. 发布 ======================
