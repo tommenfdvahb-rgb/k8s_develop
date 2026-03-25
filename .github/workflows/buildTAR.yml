@@ -14,14 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [ ubuntu-24.04, ubuntu-24.04-arm ]
-        base_image: [ rocky9, ubuntu24.04 ]
+        runner_arch: [ ubuntu-24.04, ubuntu-24.04-arm ]
+        os_type: [ deb, rpm ]
 
-    runs-on: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner_arch }}
 
-    # 并发控制，避免相同组合重复跑
     concurrency:
-      group: ${{ github.workflow }}-${{ matrix.arch }}-${{ matrix.base_image }}
+      group: ${{ github.workflow }}-${{ matrix.runner_arch }}-${{ matrix.os_type }}
       cancel-in-progress: true
 
     env:
@@ -30,20 +29,24 @@ jobs:
       CALICO_VERSION: v3.27.4
       INGRESS_VERSION: v1.11.3
       LONGHORN_VERSION: v1.6.4
-      # 新增：根据 matrix 动态映射平台
-      PLATFORM: ${{ matrix.arch == 'ubuntu-24.04' && 'linux/amd64' || 'linux/arm64' }}
+
+      # 动态映射
+      PLATFORM: ${{ matrix.runner_arch == 'ubuntu-24.04' && 'linux/amd64' || 'linux/arm64' }}
+      ARCH_NAME: ${{ matrix.runner_arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}
+      PKG_TYPE: ${{ matrix.os_type }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Prepare directories
-        run: mkdir -p release/bin release/images release/packages release/scripts
+        run: |
+          mkdir -p release/bin release/images release/packages/deb release/packages/rpm release/scripts
 
       # ====================== 1. 安装 sealos ======================
       - name: Install sealos
         run: |
-          SEALOS_ARCH=${{ matrix.arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}
+          SEALOS_ARCH=${{ matrix.runner_arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}
           curl -fL --retry 3 -o sealos.tar.gz \
             https://github.com/labring/sealos/releases/download/v${SEALOS_VERSION}/sealos_${SEALOS_VERSION}_linux_${SEALOS_ARCH}.tar.gz
           
@@ -63,7 +66,7 @@ jobs:
           registry.cn-shanghai.aliyuncs.com/labring/longhorn:${LONGHORN_VERSION}
           EOF
 
-      # ====================== 3. 拉取并打包镜像（关键修复） ======================
+      # ====================== 3. 拉取并打包镜像（多架构） ======================
       - name: Build k8s image tar
         run: |
           docker run --rm --privileged \
@@ -88,10 +91,11 @@ jobs:
               /usr/local/bin/sealos save -o release/images/k8s-images.tar $(cat k8s-images.txt)
             '
 
-      # ====================== 4. 构建系统依赖包（根据 base_image 区分） ======================
+      # ====================== 4. 下载系统依赖包（DEB / RPM 分开） ======================
       - name: Build packages
         run: |
-          if [[ "${{ matrix.base_image }}" == "ubuntu24.04" ]]; then
+          if [[ "${{ matrix.os_type }}" == "deb" ]]; then
+            echo "=== Building DEB packages for ${{ env.PLATFORM }} ==="
             docker run --platform ${{ env.PLATFORM }} --rm -v $(pwd):/out ubuntu:24.04 bash -c '
               set -e
               apt-get update -qq
@@ -101,17 +105,33 @@ jobs:
               apt-get --download-only install -y \
                 conntrack socat ipset iptables \
                 nfs-common open-iscsi iproute2 netcat-openbsd \
-                tar coreutils util-linux procps openssh-client
+                tar coreutils util-linux procps openssh-client sshpass || true
 
               cp /var/cache/apt/archives/*.deb /out/release/packages/deb/ || true
+              echo "Downloaded $(ls /out/release/packages/deb/*.deb 2>/dev/null | wc -l) deb packages"
             '
           else
-            # rocky9 使用 rpm（你可以后续完善 dnf 下载逻辑）
-            echo "Rocky9 RPM packaging not fully implemented yet. Skipping for now."
-            mkdir -p release/packages/rpm
+            echo "=== Building RPM packages for Rocky 9 (${{ env.ARCH_NAME }}) ==="
+            docker run --platform ${{ env.PLATFORM }} --rm -v $(pwd):/out rockylinux:9 bash -c '
+              set -e
+              dnf install -y dnf-plugins-core
+              mkdir -p /out/release/packages/rpm
+
+              dnf install --downloadonly --downloaddir=/out/release/packages/rpm --resolve -y \
+                conntrack-tools \
+                socat \
+                ipset \
+                iptables \
+                sshpass \
+                nfs-utils \
+                iscsi-initiator-utils \
+                iproute || true
+
+              echo "Downloaded $(ls /out/release/packages/rpm/*.rpm 2>/dev/null | wc -l) RPM packages"
+            '
           fi
 
-      # ====================== 5. 最终打包 ======================
+      # ====================== 5. 最终打包（严格按你要求的 4 个文件名） ======================
       - name: Package offline bundle
         run: |
           mkdir -p release/scripts
@@ -119,8 +139,10 @@ jobs:
           echo "${K8S_VERSION}" > release/version.txt
           echo "${SEALOS_VERSION}" > release/bin/sealos-version.txt
 
-          tar -czf k8s-offline-${{ matrix.base_image }}-${{ matrix.arch == 'ubuntu-24.04' && 'amd64' || 'arm64' }}.tar.gz -C release .
-          ls -lh *.tar.gz
+          # 生成你指定的文件名
+          TAR_NAME="k8s-offline-${{ env.ARCH_NAME }}-${{ matrix.os_type }}.tar.gz"
+          tar -czf ${TAR_NAME} -C release .
+          ls -lh k8s-offline-*.tar.gz
 
       # ====================== 6. 发布 ======================
       - name: Release
